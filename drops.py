@@ -63,32 +63,6 @@ query ViewerDropsDashboard {
   currentUser {
     dropCampaigns {
       endAt
-      game { displayName }
-      timeBasedDrops {
-        benefitEdges { name }
-      }
-    }
-  }
-}
-""".strip(),
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
-      endAt
-      game { name }
-      timeBasedDrops {
-        benefitEdges { name }
-      }
-    }
-  }
-}
-""".strip(),
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
-      endAt
       game { name }
     }
   }
@@ -291,15 +265,15 @@ def extract_campaign_reward_items(campaign: dict[str, Any]) -> list[str]:
     return out
 
 
-def find_best_drop_campaigns_list(root: Any) -> list[dict[str, Any]]:
+def find_drop_campaigns_list(root: Any) -> list[dict[str, Any]] | None:
     candidates: list[list[dict[str, Any]]] = []
     for node in iter_nodes(root):
         if isinstance(node, dict):
             for k, v in node.items():
-                if k.lower() == "dropcampaigns" and isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                if k.lower() == "dropcampaigns" and isinstance(v, list) and all(isinstance(x, dict) for x in v):
                     candidates.append([x for x in v if isinstance(x, dict)])
     if not candidates:
-        return []
+        return None
     candidates.sort(key=len, reverse=True)
     return candidates[0]
 
@@ -364,8 +338,8 @@ def fetch_active_drops() -> list[Drop]:
         if not isinstance(data, dict):
             continue
 
-        campaigns = find_best_drop_campaigns_list(data)
-        if not campaigns:
+        campaigns = find_drop_campaigns_list(data)
+        if campaigns is None:
             continue
 
         now = int(time.time())
@@ -384,8 +358,7 @@ def fetch_active_drops() -> list[Drop]:
                 drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
                 drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
 
-        if drops:
-            return drops
+        return drops
 
     if last_other_error is not None:
         raise RuntimeError(f"Twitch GQL retornou errors: {last_other_error}")
@@ -543,7 +516,7 @@ def main() -> int:
     for drop_id, entry in active.items():
         expires_at = int(entry["expires_at"])
         expired_by_time = expires_at <= now
-        expired_by_missing = scrape_ok and (drop_id not in scraped_ids)
+        expired_by_missing = scrape_ok and bool(scraped_ids) and (drop_id not in scraped_ids)
         if expired_by_time or expired_by_missing:
             to_delete.append((drop_id, entry))
         else:

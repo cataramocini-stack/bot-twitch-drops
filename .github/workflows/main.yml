@@ -1,0 +1,42 @@
+name: Twitch Drops Bot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run bot
+        env:
+          WEBHOOK_DROPS_URL: ${{ secrets.WEBHOOK_DROPS_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          ACTIVE_DROPS: ${{ secrets.ACTIVE_DROPS }}
+        run: |
+          python drops.py --output-json active_drops.json
+
+      - name: Update ACTIVE_DROPS secret
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            export GH_TOKEN="$GITHUB_TOKEN"
+          fi
+
+          json="$(cat active_drops.json)"
+          gh secret set ACTIVE_DROPS -b "$json"

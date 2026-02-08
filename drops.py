@@ -26,7 +26,7 @@ query ViewerDropsDashboard {
       endAt
       game { displayName }
       timeBasedDrops {
-        benefitEdges { node { name } }
+        benefitEdges { benefit { name } }
       }
     }
   }
@@ -52,7 +52,33 @@ query ViewerDropsDashboard {
       endAt
       game { name }
       timeBasedDrops {
-        benefitEdges { node { name } }
+        benefitEdges { benefit { name } }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endAt
+      game { displayName }
+      timeBasedDrops {
+        benefitEdges { name }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endAt
+      game { name }
+      timeBasedDrops {
+        benefitEdges { name }
       }
     }
   }
@@ -211,6 +237,14 @@ def extract_campaign_reward_items(campaign: dict[str, Any]) -> list[str]:
                 for edge in benefit_edges:
                     if not isinstance(edge, dict):
                         continue
+                    benefit = edge.get("benefit")
+                    if isinstance(benefit, dict):
+                        name = pick_first_str(benefit, ("name",))
+                        if name:
+                            names.append(name)
+                    name = pick_first_str(edge, ("name",))
+                    if name:
+                        names.append(name)
                     node = edge.get("node")
                     if isinstance(node, dict):
                         name = pick_first_str(node, ("name",))
@@ -235,6 +269,14 @@ def extract_campaign_reward_items(campaign: dict[str, Any]) -> list[str]:
             for edge in benefit_edges:
                 if not isinstance(edge, dict):
                     continue
+                benefit = edge.get("benefit")
+                if isinstance(benefit, dict):
+                    name = pick_first_str(benefit, ("name",))
+                    if name:
+                        names.append(name)
+                name = pick_first_str(edge, ("name",))
+                if name:
+                    names.append(name)
                 bnode = edge.get("node")
                 if isinstance(bnode, dict):
                     name = pick_first_str(bnode, ("name",))

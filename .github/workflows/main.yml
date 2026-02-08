@@ -22,23 +22,45 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Validate configuration
+        env:
+          WEBHOOK_DROPS_URL: ${{ secrets.WEBHOOK_DROPS_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          TWITCH_OAUTH_TOKEN: ${{ secrets.TWITCH_OAUTH_TOKEN }}
+        run: |
+          set -euxo pipefail
+          test -n "${WEBHOOK_DROPS_URL}"
+          test -n "${DISCORD_BOT_TOKEN}"
+          if [ -z "${TWITCH_OAUTH_TOKEN:-}" ]; then
+            echo "TWITCH_OAUTH_TOKEN não definido; scraping pode falhar dependendo da Twitch." >&2
+          fi
 
       - name: Run bot
         env:
           WEBHOOK_DROPS_URL: ${{ secrets.WEBHOOK_DROPS_URL }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          TWITCH_OAUTH_TOKEN: ${{ secrets.TWITCH_OAUTH_TOKEN }}
         run: |
-          python drops.py --state-file active_drops.json
+          set -euxo pipefail
+          echo "State before:"
+          cat active_drops.json || true
+          python -u drops.py --state-file active_drops.json
+          echo "State after:"
+          cat active_drops.json || true
 
       - name: Commit state file
         run: |
+          set -euxo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add active_drops.json
           if git diff --cached --quiet; then
+            echo "Nenhuma mudança em active_drops.json"
             exit 0
           fi
 

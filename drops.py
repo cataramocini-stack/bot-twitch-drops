@@ -36,19 +36,6 @@ query ViewerDropsDashboard {
 query ViewerDropsDashboard {
   currentUser {
     dropCampaigns {
-      endedAt
-      game { displayName }
-      timeBasedDrops {
-        benefitEdges { node { name } }
-      }
-    }
-  }
-}
-""".strip(),
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
       endAt
       game { displayName }
       timeBasedDrops {
@@ -62,19 +49,6 @@ query ViewerDropsDashboard {
 query ViewerDropsDashboard {
   currentUser {
     dropCampaigns {
-      endedAt
-      game { displayName }
-      timeBasedDrops {
-        benefit { name }
-      }
-    }
-  }
-}
-""".strip(),
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
       endAt
       game { name }
       timeBasedDrops {
@@ -88,30 +62,7 @@ query ViewerDropsDashboard {
 query ViewerDropsDashboard {
   currentUser {
     dropCampaigns {
-      endedAt
-      game { name }
-      timeBasedDrops {
-        benefitEdges { node { name } }
-      }
-    }
-  }
-}
-""".strip(),
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
       endAt
-      game { name }
-    }
-  }
-}
-""".strip(),
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
-      endedAt
       game { name }
     }
   }
@@ -223,12 +174,11 @@ def pick_first_str(d: Any, keys: Iterable[str]) -> str | None:
 
 
 def extract_campaign_end_at(campaign: dict[str, Any]) -> int | None:
-    for k in ("endAt", "endedAt"):
-        v = campaign.get(k)
-        if isinstance(v, str):
-            ts = parse_iso8601_to_epoch_seconds(v)
-            if ts is not None:
-                return ts
+    v = campaign.get("endAt")
+    if isinstance(v, str):
+        ts = parse_iso8601_to_epoch_seconds(v)
+        if ts is not None:
+            return ts
     return None
 
 

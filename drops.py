@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import hashlib
 import html
 import json
@@ -16,6 +17,21 @@ from typing import Any, Iterable
 
 TWITCH_DROPS_CAMPAIGNS_URL = "https://www.twitch.tv/drops/campaigns"
 DISCORD_API_BASE = "https://discord.com/api/v10"
+DEFAULT_STATE_FILE = "active_drops.json"
+
+CHROME_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.twitch.tv/",
+}
 
 
 @dataclass(frozen=True)
@@ -33,9 +49,8 @@ def http_request(
     headers: dict[str, str] | None = None,
     body: bytes | None = None,
     timeout_s: int = 30,
-) -> tuple[int, bytes]:
+) -> tuple[int, dict[str, str], bytes]:
     request_headers = {
-        "User-Agent": "bot-twitch-drops/1.0 (+https://github.com/)",
         "Accept": "*/*",
     }
     if headers:
@@ -45,9 +60,25 @@ def http_request(
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             status = int(getattr(resp, "status", 0) or 0)
-            return status, resp.read()
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            raw = resp.read()
+            encoding = (resp_headers.get("content-encoding") or "").lower().strip()
+            if encoding == "gzip":
+                try:
+                    raw = gzip.decompress(raw)
+                except Exception:
+                    pass
+            return status, resp_headers, raw
     except urllib.error.HTTPError as e:
-        return int(e.code), e.read() if e.fp else b""
+        resp_headers = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
+        raw = e.read() if e.fp else b""
+        encoding = (resp_headers.get("content-encoding") or "").lower().strip()
+        if encoding == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        return int(e.code), resp_headers, raw
 
 
 def parse_iso8601_to_epoch_seconds(value: str) -> int | None:
@@ -207,10 +238,7 @@ def find_best_campaign_list(root: Any) -> list[dict[str, Any]]:
 
 
 def fetch_active_drops_from_twitch() -> list[Drop]:
-    status, body = http_request("GET", TWITCH_DROPS_CAMPAIGNS_URL, headers={"Accept": "text/html"})
-    if status // 100 != 2:
-        raise RuntimeError(f"Falha ao buscar Twitch Drops (status={status})")
-    text = body.decode("utf-8", errors="replace")
+    text = fetch_twitch_campaigns_html()
     next_data = extract_next_data_json(text)
     if not next_data:
         raise RuntimeError("Não foi possível extrair __NEXT_DATA__ da Twitch")
@@ -240,6 +268,27 @@ def fetch_active_drops_from_twitch() -> list[Drop]:
     return drops
 
 
+def fetch_twitch_campaigns_html() -> str:
+    try:
+        import cloudscraper  # type: ignore
+
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(TWITCH_DROPS_CAMPAIGNS_URL, headers=CHROME_HEADERS, timeout=30)
+        if int(resp.status_code) // 100 != 2:
+            raise RuntimeError(f"Falha ao buscar Twitch Drops (status={resp.status_code})")
+        return resp.text
+    except Exception:
+        status, _, body = http_request(
+            "GET",
+            TWITCH_DROPS_CAMPAIGNS_URL,
+            headers=CHROME_HEADERS,
+            timeout_s=30,
+        )
+        if status // 100 != 2:
+            raise RuntimeError(f"Falha ao buscar Twitch Drops (status={status})")
+        return body.decode("utf-8", errors="replace")
+
+
 def ensure_wait_true(webhook_url: str) -> str:
     parsed = urllib.parse.urlparse(webhook_url)
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -252,7 +301,7 @@ def discord_webhook_post_message(webhook_url: str, embed: dict[str, Any]) -> dic
     url = ensure_wait_true(webhook_url)
     payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    status, resp = http_request(
+    status, _, resp = http_request(
         "POST",
         url,
         headers={"Content-Type": "application/json"},
@@ -268,7 +317,7 @@ def discord_webhook_post_message(webhook_url: str, embed: dict[str, Any]) -> dic
 
 def discord_bot_delete_message(bot_token: str, channel_id: str, message_id: str) -> int:
     url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}"
-    status, _ = http_request(
+    status, _, _ = http_request(
         "DELETE",
         url,
         headers={"Authorization": f"Bot {bot_token}"},
@@ -286,6 +335,25 @@ def build_embed(drop: Drop) -> dict[str, Any]:
 
 def load_active_drops_from_env() -> dict[str, Any]:
     raw = (os.getenv("ACTIVE_DROPS") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    return {}
+
+
+def load_active_drops_from_file(path: str) -> dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
     if not raw:
         return {}
     try:
@@ -327,6 +395,7 @@ def dump_active_drops_json(data: dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--json-only", action="store_true")
     args = parser.parse_args()
@@ -341,6 +410,8 @@ def main() -> int:
         return 2
 
     active_raw = load_active_drops_from_env()
+    if not active_raw:
+        active_raw = load_active_drops_from_file(args.state_file)
     active = normalize_active_drops(active_raw)
 
     now = int(time.time())
@@ -401,8 +472,9 @@ def main() -> int:
         posted += 1
 
     updated_json = dump_active_drops_json(active)
-    if args.output_json:
-        with open(args.output_json, "w", encoding="utf-8") as f:
+    output_path = args.output_json or args.state_file
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(updated_json)
 
     if args.json_only:

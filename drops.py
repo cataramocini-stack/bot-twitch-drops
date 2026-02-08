@@ -18,6 +18,7 @@ from typing import Any, Iterable
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 TWITCH_DROPS_CAMPAIGNS_URL = "https://www.twitch.tv/drops/campaigns"
+TWITCH_DROPS_INVENTORY_URL = "https://www.twitch.tv/drops/inventory"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
 
@@ -204,14 +205,28 @@ def extract_campaign_game_name(campaign: dict[str, Any]) -> str:
 
 
 def extract_next_data_json(html_text: str) -> dict[str, Any] | None:
-    m = re.search(
-        r'<script[^>]*id="__NEXT_DATA__"[^>]*type="application/json"[^>]*>(?P<json>.*?)</script>',
-        html_text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    if not m:
-        return None
-    raw = html.unescape(m.group("json"))
+    raw: str | None = None
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        tag = soup.find("script", attrs={"id": "__NEXT_DATA__"})
+        if tag:
+            raw = tag.string or tag.get_text()
+    except Exception:
+        raw = None
+
+    if raw is None:
+        m = re.search(
+            r'<script[^>]*id="__NEXT_DATA__"[^>]*type="application/json"[^>]*>(?P<json>.*?)</script>',
+            html_text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if not m:
+            return None
+        raw = m.group("json")
+
+    raw = html.unescape(raw)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -243,16 +258,14 @@ def find_best_campaign_list(root: Any) -> list[dict[str, Any]]:
     return candidates[0]
 
 
-VIEWER_DROPS_DASHBOARD_SHA256 = "c4d61d7b71d03b324914d3cf8ca0bc23fe25dacf54120cc954321b9704a3f4e2"
-
-
 def twitch_gql_post(operations: list[dict[str, Any]], oauth_token: str | None) -> Any:
     headers = {
         "Client-ID": TWITCH_WEB_CLIENT_ID,
         "Client-Id": TWITCH_WEB_CLIENT_ID,
-        "Content-Type": "text/plain;charset=UTF-8",
+        "Content-Type": "application/json",
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
+        "User-Agent": CHROME_HEADERS["User-Agent"],
     }
     if oauth_token:
         headers["Authorization"] = f"OAuth {oauth_token}"
@@ -314,48 +327,95 @@ def extract_campaign_benefit_names_gql(campaign: dict[str, Any]) -> list[str]:
 
 def fetch_active_drops_from_twitch_gql() -> list[Drop]:
     oauth_token = (os.getenv("TWITCH_OAUTH_TOKEN") or os.getenv("TWITCH_AUTH_TOKEN") or "").strip() or None
-    operations = [
-        {
-            "operationName": "ViewerDropsDashboard",
-            "variables": {},
-            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": VIEWER_DROPS_DASHBOARD_SHA256}},
-        }
+    query_variants = [
+        (
+            "ViewerDropsDashboard",
+            """query ViewerDropsDashboard {
+  viewer {
+    dropCampaigns {
+      endAt
+      game { displayName }
+      timeBasedDrops { benefit { name } }
+    }
+  }
+}""",
+        ),
+        (
+            "ViewerDropsDashboard",
+            """query ViewerDropsDashboard {
+  dropCampaigns {
+    endAt
+    game { displayName }
+    timeBasedDrops { benefit { name } }
+  }
+}""",
+        ),
+        (
+            "ViewerDropsDashboard",
+            """query ViewerDropsDashboard {
+  viewer {
+    dropCampaigns {
+      endAt
+      game { displayName }
+      drops { benefit { name } }
+    }
+  }
+}""",
+        ),
     ]
-    resp = twitch_gql_post(operations=operations, oauth_token=oauth_token)
-    entry = resp[0] if isinstance(resp, list) and resp else resp
-    if isinstance(entry, dict) and entry.get("errors"):
-        errors = entry.get("errors")
-        if isinstance(errors, list):
-            joined = " | ".join(str(e.get("message")) for e in errors if isinstance(e, dict))
-            if "unauth" in joined.lower() or "forbidden" in joined.lower():
-                raise AuthRequiredError(joined)
-        raise RuntimeError(f"Twitch GQL retornou errors: {errors}")
 
-    data = entry.get("data") if isinstance(entry, dict) else None
-    if not data:
-        raise AuthRequiredError("Twitch GQL sem data (provável auth)")
-
-    campaigns = find_best_drop_campaigns_list(data)
-    if not campaigns:
-        raise RuntimeError("Não foi possível localizar dropCampaigns no payload GQL")
-
-    now = int(time.time())
-    drops: list[Drop] = []
-    for campaign in campaigns:
-        if not isinstance(campaign, dict):
+    last_error: Exception | None = None
+    for operation_name, query in query_variants:
+        operations = [{"operationName": operation_name, "variables": {}, "query": query}]
+        try:
+            resp = twitch_gql_post(operations=operations, oauth_token=oauth_token)
+        except AuthRequiredError as e:
+            raise
+        except Exception as e:
+            last_error = e
             continue
-        game = extract_campaign_game_name(campaign)
-        expires_at = extract_campaign_end_at(campaign)
-        if expires_at is None or expires_at <= now:
-            continue
-        items = extract_campaign_benefit_names_gql(campaign)
-        if not items:
-            continue
-        for item in items:
-            drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
-            drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
 
-    return drops
+        entry = resp[0] if isinstance(resp, list) and resp else resp
+        if isinstance(entry, dict) and entry.get("errors"):
+            errors = entry.get("errors")
+            if isinstance(errors, list):
+                joined = " | ".join(str(e.get("message")) for e in errors if isinstance(e, dict))
+                if "unauth" in joined.lower() or "forbidden" in joined.lower():
+                    raise AuthRequiredError(joined)
+                raise RuntimeError(joined)
+            raise RuntimeError(f"Twitch GQL retornou errors: {errors}")
+
+        data = entry.get("data") if isinstance(entry, dict) else None
+        if not data:
+            last_error = RuntimeError("Twitch GQL sem data")
+            continue
+
+        campaigns = find_best_drop_campaigns_list(data)
+        if not campaigns:
+            last_error = RuntimeError("Não foi possível localizar dropCampaigns no payload GQL")
+            continue
+
+        now = int(time.time())
+        drops: list[Drop] = []
+        for campaign in campaigns:
+            if not isinstance(campaign, dict):
+                continue
+            game = extract_campaign_game_name(campaign)
+            expires_at = extract_campaign_end_at(campaign)
+            if expires_at is None or expires_at <= now:
+                continue
+            items = extract_campaign_benefit_names_gql(campaign)
+            if not items:
+                continue
+            for item in items:
+                drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
+                drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
+        if drops:
+            return drops
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Twitch GQL falhou")
 
 
 def fetch_twitch_campaigns_html() -> str:
@@ -377,6 +437,56 @@ def fetch_twitch_campaigns_html() -> str:
         if status // 100 != 2:
             raise RuntimeError(f"Falha ao buscar Twitch Drops (status={status})")
         return body.decode("utf-8", errors="replace")
+
+
+def fetch_twitch_inventory_html() -> str:
+    try:
+        import cloudscraper  # type: ignore
+
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(TWITCH_DROPS_INVENTORY_URL, headers=CHROME_HEADERS, timeout=30)
+        if int(resp.status_code) // 100 != 2:
+            raise RuntimeError(f"Falha ao buscar Twitch Drops Inventory (status={resp.status_code})")
+        return resp.text
+    except Exception:
+        status, _, body = http_request(
+            "GET",
+            TWITCH_DROPS_INVENTORY_URL,
+            headers=CHROME_HEADERS,
+            timeout_s=30,
+        )
+        if status // 100 != 2:
+            raise RuntimeError(f"Falha ao buscar Twitch Drops Inventory (status={status})")
+        return body.decode("utf-8", errors="replace")
+
+
+def fetch_active_drops_from_twitch_inventory_html() -> list[Drop]:
+    text = fetch_twitch_inventory_html()
+    next_data = extract_next_data_json(text)
+    if not next_data:
+        raise RuntimeError("Não foi possível extrair __NEXT_DATA__ do Drops Inventory")
+
+    campaigns = find_best_campaign_list(next_data)
+    if not campaigns:
+        raise RuntimeError("Não foi possível localizar campanhas no Drops Inventory")
+
+    now = int(time.time())
+    drops: list[Drop] = []
+    for campaign in campaigns:
+        if not isinstance(campaign, dict):
+            continue
+        expires_at = extract_campaign_end_at(campaign)
+        if expires_at is None or expires_at <= now:
+            continue
+        game = extract_campaign_game_name(campaign)
+        items = extract_campaign_reward_items(campaign)
+        if not items:
+            continue
+        for item in items:
+            drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
+            drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
+
+    return drops
 
 
 def fetch_active_drops_from_twitch_html() -> list[Drop]:
@@ -479,6 +589,10 @@ def fetch_active_drops_from_twitch() -> list[Drop]:
     try:
         return fetch_active_drops_from_twitch_gql()
     except AuthRequiredError:
+        pass
+    try:
+        return fetch_active_drops_from_twitch_inventory_html()
+    except Exception:
         pass
     try:
         return fetch_active_drops_from_twitch_html()

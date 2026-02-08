@@ -18,23 +18,106 @@ TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
 
-VIEWER_DROPS_DASHBOARD_QUERY = """
+VIEWER_DROPS_DASHBOARD_QUERIES = [
+    """
 query ViewerDropsDashboard {
   currentUser {
     dropCampaigns {
       endAt
-      game {
-        displayName
-      }
+      game { displayName }
       timeBasedDrops {
-        benefit {
-          name
-        }
+        benefitEdges { node { name } }
       }
     }
   }
 }
-""".strip()
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endedAt
+      game { displayName }
+      timeBasedDrops {
+        benefitEdges { node { name } }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endAt
+      game { displayName }
+      timeBasedDrops {
+        benefit { name }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endedAt
+      game { displayName }
+      timeBasedDrops {
+        benefit { name }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endAt
+      game { name }
+      timeBasedDrops {
+        benefitEdges { node { name } }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endedAt
+      game { name }
+      timeBasedDrops {
+        benefitEdges { node { name } }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endAt
+      game { name }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endedAt
+      game { name }
+    }
+  }
+}
+""".strip(),
+]
 
 CHROME_HEADERS = {
     "User-Agent": (
@@ -140,9 +223,12 @@ def pick_first_str(d: Any, keys: Iterable[str]) -> str | None:
 
 
 def extract_campaign_end_at(campaign: dict[str, Any]) -> int | None:
-    v = campaign.get("endAt")
-    if isinstance(v, str):
-        return parse_iso8601_to_epoch_seconds(v)
+    for k in ("endAt", "endedAt"):
+        v = campaign.get(k)
+        if isinstance(v, str):
+            ts = parse_iso8601_to_epoch_seconds(v)
+            if ts is not None:
+                return ts
     return None
 
 
@@ -155,8 +241,36 @@ def extract_campaign_game_name(campaign: dict[str, Any]) -> str:
     return "Twitch Drops"
 
 
-def extract_campaign_benefit_names(campaign: dict[str, Any]) -> list[str]:
+def extract_campaign_reward_items(campaign: dict[str, Any]) -> list[str]:
     names: list[str] = []
+
+    tbd_list = campaign.get("timeBasedDrops")
+    if isinstance(tbd_list, list):
+        for tbd in tbd_list:
+            if not isinstance(tbd, dict):
+                continue
+
+            benefit = tbd.get("benefit")
+            if isinstance(benefit, dict):
+                name = pick_first_str(benefit, ("name",))
+                if name:
+                    names.append(name)
+
+            benefit_edges = tbd.get("benefitEdges")
+            if isinstance(benefit_edges, list):
+                for edge in benefit_edges:
+                    if not isinstance(edge, dict):
+                        continue
+                    node = edge.get("node")
+                    if isinstance(node, dict):
+                        name = pick_first_str(node, ("name",))
+                        if name:
+                            names.append(name)
+
+            name = pick_first_str(tbd, ("name",))
+            if name:
+                names.append(name)
+
     for node in iter_nodes(campaign):
         if not isinstance(node, dict):
             continue
@@ -165,6 +279,17 @@ def extract_campaign_benefit_names(campaign: dict[str, Any]) -> list[str]:
             name = pick_first_str(benefit, ("name",))
             if name:
                 names.append(name)
+
+        benefit_edges = node.get("benefitEdges")
+        if isinstance(benefit_edges, list):
+            for edge in benefit_edges:
+                if not isinstance(edge, dict):
+                    continue
+                bnode = edge.get("node")
+                if isinstance(bnode, dict):
+                    name = pick_first_str(bnode, ("name",))
+                    if name:
+                        names.append(name)
     seen: set[str] = set()
     out: list[str] = []
     for n in names:
@@ -217,43 +342,64 @@ def fetch_active_drops() -> list[Drop]:
     if not token:
         raise RuntimeError("TWITCH_OAUTH_TOKEN não definido.")
 
-    operations = [
-        {
-            "operationName": "ViewerDropsDashboard",
-            "variables": {},
-            "query": VIEWER_DROPS_DASHBOARD_QUERY,
-        }
-    ]
-    resp = twitch_gql_post(operations=operations, oauth_token=token)
-    entry = resp[0] if isinstance(resp, list) and resp else resp
-    if isinstance(entry, dict) and entry.get("errors"):
-        raise RuntimeError(f"Twitch GQL retornou errors: {entry.get('errors')}")
+    last_schema_error: Any = None
+    last_other_error: Any = None
 
-    data = entry.get("data") if isinstance(entry, dict) else None
-    if not isinstance(data, dict):
-        raise RuntimeError("Twitch GQL não retornou data.")
-
-    campaigns = find_best_drop_campaigns_list(data)
-    if not campaigns:
-        raise RuntimeError("Não foi possível localizar dropCampaigns no payload do GQL.")
-
-    now = int(time.time())
-    drops: list[Drop] = []
-    for campaign in campaigns:
-        if not isinstance(campaign, dict):
+    for query in VIEWER_DROPS_DASHBOARD_QUERIES:
+        operations = [
+            {
+                "operationName": "ViewerDropsDashboard",
+                "variables": {},
+                "query": query,
+            }
+        ]
+        resp = twitch_gql_post(operations=operations, oauth_token=token)
+        entry = resp[0] if isinstance(resp, list) and resp else resp
+        if not isinstance(entry, dict):
             continue
-        expires_at = extract_campaign_end_at(campaign)
-        if expires_at is None or expires_at <= now:
-            continue
-        game = extract_campaign_game_name(campaign)
-        items = extract_campaign_benefit_names(campaign)
-        if not items:
-            continue
-        for item in items:
-            drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
-            drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
 
-    return drops
+        errors = entry.get("errors")
+        data = entry.get("data")
+
+        if errors and not data:
+            msgs = " ".join(str(e.get("message", "")) for e in errors if isinstance(e, dict))
+            if "Cannot query field" in msgs or "Unknown argument" in msgs or "Unknown type" in msgs:
+                last_schema_error = errors
+                continue
+            last_other_error = errors
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        campaigns = find_best_drop_campaigns_list(data)
+        if not campaigns:
+            continue
+
+        now = int(time.time())
+        drops: list[Drop] = []
+        for campaign in campaigns:
+            if not isinstance(campaign, dict):
+                continue
+            expires_at = extract_campaign_end_at(campaign)
+            if expires_at is None or expires_at <= now:
+                continue
+            game = extract_campaign_game_name(campaign)
+            items = extract_campaign_reward_items(campaign)
+            if not items:
+                items = ["Drops"]
+            for item in items:
+                drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
+                drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
+
+        if drops:
+            return drops
+
+    if last_other_error is not None:
+        raise RuntimeError(f"Twitch GQL retornou errors: {last_other_error}")
+    if last_schema_error is not None:
+        raise RuntimeError(f"Twitch GQL schema incompatível: {last_schema_error}")
+    raise RuntimeError("Não foi possível obter campanhas de drops via Twitch GQL.")
 
 
 def ensure_wait_true(webhook_url: str) -> str:

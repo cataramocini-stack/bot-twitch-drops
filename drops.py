@@ -15,9 +15,26 @@ from typing import Any, Iterable
 
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
-VIEWER_DROPS_DASHBOARD_SHA256 = "c4d61d7b71d03b324914d3cf8ca0bc23fe25dacf54120cc954321b9704a3f4e2"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
+
+VIEWER_DROPS_DASHBOARD_QUERY = """
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
+      endAt
+      game {
+        displayName
+      }
+      timeBasedDrops {
+        benefit {
+          name
+        }
+      }
+    }
+  }
+}
+""".strip()
 
 CHROME_HEADERS = {
     "User-Agent": (
@@ -204,7 +221,7 @@ def fetch_active_drops() -> list[Drop]:
         {
             "operationName": "ViewerDropsDashboard",
             "variables": {},
-            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": VIEWER_DROPS_DASHBOARD_SHA256}},
+            "query": VIEWER_DROPS_DASHBOARD_QUERY,
         }
     ]
     resp = twitch_gql_post(operations=operations, oauth_token=token)

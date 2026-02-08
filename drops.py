@@ -16,7 +16,7 @@ from typing import Any, Iterable
 
 
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
-TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brs4896cdncy3ra7"
+TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 TWITCH_DROPS_CAMPAIGNS_URL = "https://www.twitch.tv/drops/campaigns"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
@@ -249,7 +249,8 @@ VIEWER_DROPS_DASHBOARD_SHA256 = "c4d61d7b71d03b324914d3cf8ca0bc23fe25dacf54120cc
 def twitch_gql_post(operations: list[dict[str, Any]], oauth_token: str | None) -> Any:
     headers = {
         "Client-ID": TWITCH_WEB_CLIENT_ID,
-        "Content-Type": "application/json",
+        "Client-Id": TWITCH_WEB_CLIENT_ID,
+        "Content-Type": "text/plain;charset=UTF-8",
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
     }
@@ -266,7 +267,8 @@ def twitch_gql_post(operations: list[dict[str, Any]], oauth_token: str | None) -
     if status in (401, 403):
         raise AuthRequiredError(f"GQL retornou status={status}")
     if status // 100 != 2:
-        raise RuntimeError(f"Falha ao chamar Twitch GQL (status={status})")
+        snippet = body[:800].decode("utf-8", errors="replace")
+        raise RuntimeError(f"Falha ao chamar Twitch GQL (status={status}) body={snippet!r}")
 
     try:
         parsed = json.loads(body.decode("utf-8", errors="replace"))

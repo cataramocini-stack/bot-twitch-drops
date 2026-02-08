@@ -3,7 +3,6 @@ import gzip
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -11,12 +10,12 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 
-TWITCHDROPS_NET_URL = "https://twitchdrops.net/"
-TWITCHDROPS_NET_GAMES_URL = "https://www.twitchdrops.net/games"
-TRACKER_GG_TWITCH_DROPS_URL = "https://www.tracker.gg/twitch-drops"
+TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+VIEWER_DROPS_DASHBOARD_SHA256 = "c4d61d7b71d03b324914d3cf8ca0bc23fe25dacf54120cc954321b9704a3f4e2"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
 
@@ -102,223 +101,142 @@ def stable_drop_id(game: str, item: str, expires_at: int) -> str:
     return hashlib.sha1(raw).hexdigest()
 
 
-def normalize_ws(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
+def iter_nodes(node: Any) -> Iterable[Any]:
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from iter_nodes(v)
+    elif isinstance(node, list):
+        yield node
+        for it in node:
+            yield from iter_nodes(it)
 
 
-MONTH_RE = re.compile(
-    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b",
-    flags=re.IGNORECASE,
-)
-
-
-def parse_date_to_epoch_seconds(text: str) -> int | None:
-    s = normalize_ws(text)
-    if not s:
+def pick_first_str(d: Any, keys: Iterable[str]) -> str | None:
+    if not isinstance(d, dict):
         return None
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
-    m = re.search(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?)?", s)
-    if m:
-        ts = parse_iso8601_to_epoch_seconds(m.group(0))
-        if ts is not None:
-            return ts
 
-    if not MONTH_RE.search(s):
-        return None
+def extract_campaign_end_at(campaign: dict[str, Any]) -> int | None:
+    v = campaign.get("endAt")
+    if isinstance(v, str):
+        return parse_iso8601_to_epoch_seconds(v)
+    return None
 
-    s = re.sub(r"\b(UTC|GMT)\b", "", s, flags=re.IGNORECASE).strip()
-    s = s.replace("Sept", "Sep").replace("sept", "Sep")
 
-    fmts = (
-        "%b %d, %Y",
-        "%B %d, %Y",
-        "%b %d %Y",
-        "%B %d %Y",
-        "%d %b %Y",
-        "%d %B %Y",
-        "%b %d, %Y %H:%M",
-        "%B %d, %Y %H:%M",
-        "%b %d, %Y %H:%M:%S",
-        "%B %d, %Y %H:%M:%S",
-    )
-    for fmt in fmts:
-        try:
-            dt = datetime.strptime(s, fmt)
-            dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-        except ValueError:
+def extract_campaign_game_name(campaign: dict[str, Any]) -> str:
+    game = campaign.get("game")
+    if isinstance(game, dict):
+        name = pick_first_str(game, ("displayName", "name", "title"))
+        if name:
+            return name
+    return "Twitch Drops"
+
+
+def extract_campaign_benefit_names(campaign: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for node in iter_nodes(campaign):
+        if not isinstance(node, dict):
             continue
-    return None
+        benefit = node.get("benefit")
+        if isinstance(benefit, dict):
+            name = pick_first_str(benefit, ("name",))
+            if name:
+                names.append(name)
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
+    return out
 
 
-def fetch_html(url: str) -> str:
+def find_best_drop_campaigns_list(root: Any) -> list[dict[str, Any]]:
+    candidates: list[list[dict[str, Any]]] = []
+    for node in iter_nodes(root):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k.lower() == "dropcampaigns" and isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                    candidates.append([x for x in v if isinstance(x, dict)])
+    if not candidates:
+        return []
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
+def twitch_gql_post(operations: list[dict[str, Any]], oauth_token: str) -> Any:
+    headers = {
+        "Client-ID": TWITCH_WEB_CLIENT_ID,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "User-Agent": CHROME_HEADERS["User-Agent"],
+        "Authorization": f"OAuth {oauth_token}",
+    }
+    status, _, body = http_request(
+        "POST",
+        TWITCH_GQL_URL,
+        headers=headers,
+        body=json.dumps(operations, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        timeout_s=30,
+    )
+    if status // 100 != 2:
+        snippet = body[:800].decode("utf-8", errors="replace")
+        raise RuntimeError(f"Falha ao chamar Twitch GQL (status={status}) body={snippet!r}")
     try:
-        import cloudscraper  # type: ignore
-
-        scraper = cloudscraper.create_scraper()
-        resp = scraper.get(url, headers=CHROME_HEADERS, timeout=30)
-        if int(resp.status_code) // 100 != 2:
-            raise RuntimeError(f"Falha ao buscar {url} (status={resp.status_code})")
-        return str(resp.text)
-    except Exception:
-        status, _, body = http_request("GET", url, headers=CHROME_HEADERS, timeout_s=30)
-        if status // 100 != 2:
-            raise RuntimeError(f"Falha ao buscar {url} (status={status})")
-        return body.decode("utf-8", errors="replace")
+        return json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Resposta inválida do Twitch GQL: {e}") from e
 
 
-def guess_game_name_from_container(container: Any) -> str | None:
-    try:
-        for tag_name in ("h1", "h2", "h3", "h4", "strong"):
-            t = container.find(tag_name)
-            if t:
-                val = normalize_ws(t.get_text(" ", strip=True))
-                if 3 <= len(val) <= 80 and "active" not in val.lower():
-                    return val
-    except Exception:
-        pass
+def fetch_active_drops() -> list[Drop]:
+    token = (os.getenv("TWITCH_OAUTH_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError("TWITCH_OAUTH_TOKEN não definido.")
 
-    try:
-        for a in container.find_all("a"):
-            val = normalize_ws(a.get_text(" ", strip=True))
-            if 3 <= len(val) <= 80 and "active" not in val.lower() and "drops" not in val.lower():
-                return val
-    except Exception:
-        pass
-    return None
+    operations = [
+        {
+            "operationName": "ViewerDropsDashboard",
+            "variables": {},
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": VIEWER_DROPS_DASHBOARD_SHA256}},
+        }
+    ]
+    resp = twitch_gql_post(operations=operations, oauth_token=token)
+    entry = resp[0] if isinstance(resp, list) and resp else resp
+    if isinstance(entry, dict) and entry.get("errors"):
+        raise RuntimeError(f"Twitch GQL retornou errors: {entry.get('errors')}")
 
+    data = entry.get("data") if isinstance(entry, dict) else None
+    if not isinstance(data, dict):
+        raise RuntimeError("Twitch GQL não retornou data.")
 
-def extract_active_drops_from_table(html_text: str) -> list[Drop]:
-    from bs4 import BeautifulSoup  # type: ignore
+    campaigns = find_best_drop_campaigns_list(data)
+    if not campaigns:
+        raise RuntimeError("Não foi possível localizar dropCampaigns no payload do GQL.")
 
-    soup = BeautifulSoup(html_text, "html.parser")
     now = int(time.time())
     drops: list[Drop] = []
-
-    for table in soup.find_all("table"):
-        header_cells = table.find_all("th")
-        headers = [normalize_ws(h.get_text(" ", strip=True)).lower() for h in header_cells]
-        if not headers:
+    for campaign in campaigns:
+        if not isinstance(campaign, dict):
             continue
-
-        def find_col(*needles: str) -> int | None:
-            for i, h in enumerate(headers):
-                for n in needles:
-                    if n in h:
-                        return i
-            return None
-
-        game_i = find_col("game", "jogo")
-        status_i = find_col("status")
-        date_i = find_col("date", "data", "end", "until", "expires")
-        if game_i is None or status_i is None or date_i is None:
+        expires_at = extract_campaign_end_at(campaign)
+        if expires_at is None or expires_at <= now:
             continue
-
-        for tr in table.find_all("tr"):
-            tds = tr.find_all(["td", "th"])
-            if len(tds) <= max(game_i, status_i, date_i):
-                continue
-
-            game = normalize_ws(tds[game_i].get_text(" ", strip=True))
-            status = normalize_ws(tds[status_i].get_text(" ", strip=True))
-            date_text = normalize_ws(tds[date_i].get_text(" ", strip=True))
-
-            if not game:
-                continue
-            if "active" not in status.lower():
-                continue
-
-            expires_at = parse_date_to_epoch_seconds(date_text)
-            if expires_at is None or expires_at <= now:
-                continue
-
-            item = "Active"
+        game = extract_campaign_game_name(campaign)
+        items = extract_campaign_benefit_names(campaign)
+        if not items:
+            continue
+        for item in items:
             drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
             drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
 
     return drops
-
-
-def extract_active_drops_from_cards(html_text: str) -> list[Drop]:
-    from bs4 import BeautifulSoup  # type: ignore
-
-    soup = BeautifulSoup(html_text, "html.parser")
-    now = int(time.time())
-    drops: list[Drop] = []
-
-    date_pat = re.compile(
-        r"(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?)?"
-        r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})",
-        flags=re.IGNORECASE,
-    )
-
-    for node in soup.find_all(string=re.compile(r"\bactive\b", flags=re.IGNORECASE)):
-        container = getattr(node, "find_parent", lambda *_: None)(["tr", "article", "li", "div"])
-        if not container:
-            continue
-
-        text = normalize_ws(container.get_text(" ", strip=True))
-        if "active" not in text.lower():
-            continue
-
-        m = date_pat.search(text)
-        if not m:
-            continue
-        expires_at = parse_date_to_epoch_seconds(m.group(1))
-        if expires_at is None or expires_at <= now:
-            continue
-
-        game = guess_game_name_from_container(container)
-        if not game:
-            continue
-
-        item = "Active"
-        drop_id = stable_drop_id(game=game, item=item, expires_at=expires_at)
-        drops.append(Drop(drop_id=drop_id, game=game, item=item, expires_at=expires_at))
-
-    dedup: dict[str, Drop] = {}
-    for d in drops:
-        dedup[d.drop_id] = d
-    return list(dedup.values())
-
-
-def fetch_active_drops_from_twitchdrops_net() -> list[Drop]:
-    html_text = fetch_html(TWITCHDROPS_NET_URL)
-    drops = extract_active_drops_from_table(html_text)
-    if drops:
-        return drops
-
-    drops = extract_active_drops_from_cards(html_text)
-    if drops:
-        return drops
-
-    html_text = fetch_html(TWITCHDROPS_NET_GAMES_URL)
-    drops = extract_active_drops_from_table(html_text)
-    if drops:
-        return drops
-    drops = extract_active_drops_from_cards(html_text)
-    if drops:
-        return drops
-
-    raise RuntimeError("Não foi possível extrair drops ativos do TwitchDrops.net")
-
-
-def fetch_active_drops_from_tracker_gg() -> list[Drop]:
-    html_text = fetch_html(TRACKER_GG_TWITCH_DROPS_URL)
-    drops = extract_active_drops_from_table(html_text)
-    if drops:
-        return drops
-    drops = extract_active_drops_from_cards(html_text)
-    if drops:
-        return drops
-    raise RuntimeError("Não foi possível extrair drops ativos do tracker.gg")
-
-
-def fetch_active_drops() -> list[Drop]:
-    try:
-        return fetch_active_drops_from_twitchdrops_net()
-    except Exception:
-        return fetch_active_drops_from_tracker_gg()
 
 
 def ensure_wait_true(webhook_url: str) -> str:
@@ -434,11 +352,15 @@ def main() -> int:
 
     webhook_url = (os.getenv("WEBHOOK_DROPS_URL") or "").strip()
     bot_token = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+    twitch_token = (os.getenv("TWITCH_OAUTH_TOKEN") or "").strip()
     if not webhook_url:
         print("WEBHOOK_DROPS_URL não definido.", file=sys.stderr)
         return 2
     if not bot_token:
         print("DISCORD_BOT_TOKEN não definido.", file=sys.stderr)
+        return 2
+    if not twitch_token:
+        print("TWITCH_OAUTH_TOKEN não definido.", file=sys.stderr)
         return 2
 
     active_raw = load_active_drops_from_env()

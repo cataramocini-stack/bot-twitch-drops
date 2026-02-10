@@ -504,8 +504,6 @@ def main() -> int:
         scrape_ok = False
         scraped = []
         print(f"Scraping falhou: {e}", file=sys.stderr)
-        if (os.getenv("GITHUB_ACTIONS") or "").lower() == "true":
-            return 3
 
     scraped_by_id = {d.drop_id: d for d in scraped}
     scraped_ids = set(scraped_by_id.keys())

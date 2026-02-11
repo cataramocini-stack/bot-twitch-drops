@@ -14,7 +14,7 @@ TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
 
-# QUERY CORRIGIDA: Usa o caminho que a Twitch autoriza para usuários comuns
+# QUERIES ATUALIZADAS: Removido o campo "node" que causou o erro
 VIEWER_DROPS_DASHBOARD_QUERIES = [
     """
 query ViewerDropsDashboard {
@@ -30,10 +30,27 @@ query ViewerDropsDashboard {
       timeBasedDrops {
         id
         benefitEdges {
-          node {
+          benefit {
             name
           }
         }
+      }
+    }
+  }
+}
+""".strip(),
+    """
+query ViewerDropsDashboardFallback {
+  currentUser {
+    dropCampaigns {
+      id
+      name
+      endAt
+      game {
+        displayName
+      }
+      timeBasedDrops {
+        id
       }
     }
   }
@@ -86,10 +103,16 @@ def scrape_twitch_drops(oauth_token: str) -> Iterable[Drop]:
                     drop_id = d.get("id")
                     item_name = "Recompensa de Drop"
                     
-                    # Tenta extrair o nome do item da nova estrutura da Twitch
+                    # Lógica robusta para pegar o nome do item
                     benefits = d.get("benefitEdges", [])
                     if benefits and len(benefits) > 0:
-                        item_name = benefits[0].get("node", {}).get("name", item_name)
+                        # Tenta pegar direto do benefit (nova estrutura)
+                        b = benefits[0].get("benefit")
+                        if b:
+                            item_name = b.get("name", item_name)
+                        # Fallback se ainda usar node em algum lugar
+                        elif "node" in benefits[0]:
+                            item_name = benefits[0]["node"].get("name", item_name)
 
                     yield Drop(id=drop_id, game=game_name, item=item_name, expires_at=expires_at)
             return
@@ -141,10 +164,12 @@ def main():
         print("Erro: Faltam variáveis de ambiente (Secrets).")
         sys.exit(1)
 
-    # Carregar estado atual
     if os.path.exists(args.state_file):
         with open(args.state_file, "r", encoding="utf-8") as f:
-            active = json.load(f)
+            try:
+                active = json.load(f)
+            except:
+                active = {}
     else:
         active = {}
 
@@ -162,7 +187,6 @@ def main():
     deleted = 0
     to_remove = []
 
-    # 1. Deletar expirados
     for drop_id, info in active.items():
         try:
             expiry = datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00"))
@@ -176,7 +200,6 @@ def main():
     for r in to_remove:
         active.pop(r, None)
 
-    # 2. Postar novos
     posted = 0
     for drop in scraped:
         if drop.id in active:
@@ -184,16 +207,16 @@ def main():
         
         try:
             msg = discord_webhook_post_message(webhook_url, build_embed(drop))
-            active[drop.id] = {
-                "message_id": msg["id"],
-                "channel_id": msg["channel_id"],
-                "expires_at": drop.expires_at
-            }
-            posted += 1
+            if msg and "id" in msg:
+                active[drop.id] = {
+                    "message_id": msg["id"],
+                    "channel_id": msg["channel_id"],
+                    "expires_at": drop.expires_at
+                }
+                posted += 1
         except Exception as e:
             print(f"Erro ao postar drop {drop.id}: {e}")
 
-    # Salvar novo estado
     with open(args.state_file, "w", encoding="utf-8") as f:
         json.dump(active, f, indent=2, ensure_ascii=False)
 

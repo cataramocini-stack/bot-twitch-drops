@@ -25,6 +25,7 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Validate configuration
         env:
@@ -42,11 +43,12 @@ jobs:
           WEBHOOK_DROPS_URL: ${{ secrets.WEBHOOK_DROPS_URL }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           TWITCH_OAUTH_TOKEN: ${{ secrets.TWITCH_OAUTH_TOKEN }}
+          USE_PLAYWRIGHT: "1"
         run: |
           set -euxo pipefail
           echo "State before:"
           cat active_drops.json || true
-          python -u drops.py --state-file active_drops.json
+          python -u drops.py --state-file active_drops.json --use-playwright --ci
           echo "State after:"
           cat active_drops.json || true
 

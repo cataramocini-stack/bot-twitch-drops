@@ -1,10 +1,7 @@
 import argparse
-import gzip
-import hashlib
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,46 +9,32 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
 
-# QUERY ATUALIZADA: Removido currentUser para busca global e corrigido campos de benefício
+# QUERY CORRIGIDA: Usa o caminho que a Twitch autoriza para usuários comuns
 VIEWER_DROPS_DASHBOARD_QUERIES = [
     """
-query GlobalDrops {
-  dropCampaigns(filter: ACTIVE) {
-    id
-    name
-    endAt
-    game {
+query ViewerDropsDashboard {
+  currentUser {
+    dropCampaigns {
       id
-      displayName
-    }
-    timeBasedDrops {
-      id
-      benefitEdges {
-        node {
-          name
+      name
+      endAt
+      game {
+        id
+        displayName
+      }
+      timeBasedDrops {
+        id
+        benefitEdges {
+          node {
+            name
+          }
         }
       }
-    }
-  }
-}
-""".strip(),
-    """
-query GlobalDropsFallback {
-  dropCampaigns {
-    id
-    name
-    endAt
-    game {
-      displayName
-    }
-    timeBasedDrops {
-      id
     }
   }
 }
@@ -90,26 +73,23 @@ def scrape_twitch_drops(oauth_token: str) -> Iterable[Drop]:
                 errors.append(data["errors"])
                 continue
             
-            # Ajuste para ler campanhas globais ou de usuário
-            campaigns = data.get("data", {}).get("dropCampaigns") or \
-                        data.get("data", {}).get("currentUser", {}).get("dropCampaigns")
-            
-            if not campaigns:
+            user = data.get("data", {}).get("currentUser")
+            if not user:
                 continue
 
+            campaigns = user.get("dropCampaigns") or []
             for campaign in campaigns:
-                game_name = campaign.get("game", {}).get("displayName") or campaign.get("game", {}).get("name", "Unknown Game")
+                game_name = campaign.get("game", {}).get("displayName", "Jogo Desconhecido")
                 expires_at = campaign.get("endAt")
                 
                 for d in campaign.get("timeBasedDrops", []):
                     drop_id = d.get("id")
-                    # Tenta pegar o nome do item de diferentes estruturas
                     item_name = "Recompensa de Drop"
+                    
+                    # Tenta extrair o nome do item da nova estrutura da Twitch
                     benefits = d.get("benefitEdges", [])
-                    if benefits and isinstance(benefits, list):
+                    if benefits and len(benefits) > 0:
                         item_name = benefits[0].get("node", {}).get("name", item_name)
-                    elif d.get("benefit"):
-                        item_name = d.get("benefit", {}).get("name", item_name)
 
                     yield Drop(id=drop_id, game=game_name, item=item_name, expires_at=expires_at)
             return
@@ -141,36 +121,35 @@ def discord_webhook_post_message(webhook_url: str, embed: dict) -> dict:
 
 def build_embed(drop: Drop) -> dict:
     return {
-        "title": f"Novo Drop Disponível: {drop.game}",
+        "title": f"🎮 Novo Drop: {drop.game}",
         "description": f"**Item:** {drop.item}\n**Expira em:** {drop.expires_at}",
         "color": 0x9146FF,
+        "footer": {"text": "Monitor de Drops Automático"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-def load_active_drops(path: str) -> dict:
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def dump_active_drops_json(active: dict) -> str:
-    return json.dumps(active, indent=2, ensure_ascii=False)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
-    parser.add_argument("--output-json", help="Caminho para salvar o novo estado")
-    parser.add_argument("--json-only", action="store_true")
     args = parser.parse_args()
 
     webhook_url = os.getenv("WEBHOOK_DROPS_URL")
     bot_token = os.getenv("DISCORD_BOT_TOKEN")
     oauth_token = os.getenv("TWITCH_OAUTH_TOKEN")
 
-    active = load_active_drops(args.state_file)
+    if not all([webhook_url, bot_token, oauth_token]):
+        print("Erro: Faltam variáveis de ambiente (Secrets).")
+        sys.exit(1)
+
+    # Carregar estado atual
+    if os.path.exists(args.state_file):
+        with open(args.state_file, "r", encoding="utf-8") as f:
+            active = json.load(f)
+    else:
+        active = {}
+
     scraped = []
     scrape_ok = True
-
     try:
         scraped = list(scrape_twitch_drops(oauth_token))
     except Exception as e:
@@ -181,10 +160,9 @@ def main():
     scraped_ids = {d.id for d in scraped}
     
     deleted = 0
-    kept = 0
     to_remove = []
 
-    # Verificar o que precisa ser deletado (expirados ou que sumiram da Twitch)
+    # 1. Deletar expirados
     for drop_id, info in active.items():
         try:
             expiry = datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00"))
@@ -192,37 +170,32 @@ def main():
                 discord_api_delete_message(bot_token, info["channel_id"], info["message_id"])
                 to_remove.append(drop_id)
                 deleted += 1
-            else:
-                kept += 1
         except Exception:
             to_remove.append(drop_id)
 
     for r in to_remove:
         active.pop(r, None)
 
-    # Postar novos drops
+    # 2. Postar novos
     posted = 0
     for drop in scraped:
         if drop.id in active:
             continue
         
-        embed = build_embed(drop)
         try:
-            msg = discord_webhook_post_message(webhook_url, embed)
+            msg = discord_webhook_post_message(webhook_url, build_embed(drop))
             active[drop.id] = {
                 "message_id": msg["id"],
                 "channel_id": msg["channel_id"],
-                "expires_at": drop.expires_at,
-                "game": drop.game,
-                "item": drop.item
+                "expires_at": drop.expires_at
             }
             posted += 1
         except Exception as e:
             print(f"Erro ao postar drop {drop.id}: {e}")
 
-    updated_json = dump_active_drops_json(active)
+    # Salvar novo estado
     with open(args.state_file, "w", encoding="utf-8") as f:
-        f.write(updated_json)
+        json.dump(active, f, indent=2, ensure_ascii=False)
 
     print(json.dumps({
         "scrape_ok": scrape_ok,

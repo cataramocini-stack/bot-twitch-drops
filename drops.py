@@ -16,37 +16,29 @@ TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DEFAULT_STATE_FILE = "active_drops.json"
 
-# Gera um Device ID aleatório para tentar passar na "Integrity Check"
-def generate_device_id():
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=32))
-
-DEVICE_ID = generate_device_id()
-
-VIEWER_DROPS_DASHBOARD_QUERIES = [
-    """
-query ViewerDropsDashboard {
-  currentUser {
-    dropCampaigns {
+# QUERY GLOBAL: Usa o schema que lista TODAS as campanhas ativas na plataforma
+GLOBAL_DROPS_QUERY = """
+query {
+  allDropCampaigns {
+    id
+    name
+    status
+    endAt
+    game {
       id
-      name
-      endAt
-      game {
-        id
-        displayName
-      }
-      timeBasedDrops {
-        id
-        benefitEdges {
-          benefit {
-            name
-          }
+      displayName
+    }
+    timeBasedDrops {
+      id
+      benefitEdges {
+        benefit {
+          name
         }
       }
     }
   }
 }
 """.strip()
-]
 
 CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 
@@ -58,18 +50,15 @@ class Drop:
     expires_at: str
 
 def twitch_gql_request(query: str, oauth_token: str) -> dict:
-    # Headers expandidos para parecer um navegador real e evitar "Integrity Check"
     headers = {
         "Client-Id": TWITCH_WEB_CLIENT_ID,
-        "Authorization": f"OAuth {oauth_token}",
         "User-Agent": CHROME_USER_AGENT,
         "Content-Type": "application/json",
-        "X-Device-Id": DEVICE_ID,
-        "Client-Session-Id": generate_device_id()[:16],
-        "Client-Version": "782f9547-38e4-4d10-8451-246e6a124032", # Versão atual comum
-        "Origin": "https://www.twitch.tv",
-        "Referer": "https://www.twitch.tv/"
+        "X-Device-Id": ''.join(random.choices(string.ascii_lowercase + string.digits, k=32)),
     }
+    # Se tivermos o token, enviamos, mas para queries globais ele é menos crítico
+    if oauth_token:
+        headers["Authorization"] = f"OAuth {oauth_token}"
     
     req = urllib.request.Request(
         TWITCH_GQL_URL,
@@ -80,44 +69,36 @@ def twitch_gql_request(query: str, oauth_token: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 def scrape_twitch_drops(oauth_token: str) -> Iterable[Drop]:
-    errors = []
-    for query in VIEWER_DROPS_DASHBOARD_QUERIES:
-        try:
-            data = twitch_gql_request(query, oauth_token)
-            
-            # Se a Twitch responder com erro de integridade
-            if "errors" in data:
-                for err in data["errors"]:
-                    if "integrity check" in err.get("message", "").lower():
-                        raise RuntimeError("A Twitch bloqueou o bot (Integrity Check). Tente gerar um novo token.")
-                errors.append(data["errors"])
-                continue
-            
-            user = data.get("data", {}).get("currentUser")
-            if not user:
+    try:
+        data = twitch_gql_request(GLOBAL_DROPS_QUERY, oauth_token)
+        
+        if "errors" in data:
+            # Se a query global falhar, o log nos dirá o porquê
+            raise RuntimeError(f"Twitch GQL Erro: {data['errors']}")
+        
+        campaigns = data.get("data", {}).get("allDropCampaigns") or []
+        
+        for campaign in campaigns:
+            # Filtramos apenas campanhas ativas (ACTIVE)
+            if campaign.get("status") != "ACTIVE":
                 continue
 
-            campaigns = user.get("dropCampaigns") or []
-            for campaign in campaigns:
-                game_name = campaign.get("game", {}).get("displayName", "Jogo Desconhecido")
-                expires_at = campaign.get("endAt")
+            game_name = campaign.get("game", {}).get("displayName", "Jogo Desconhecido")
+            expires_at = campaign.get("endAt")
+            
+            for d in campaign.get("timeBasedDrops", []):
+                drop_id = d.get("id")
+                item_name = "Recompensa de Drop"
                 
-                for d in campaign.get("timeBasedDrops", []):
-                    drop_id = d.get("id")
-                    item_name = "Recompensa de Drop"
-                    
-                    benefits = d.get("benefitEdges", [])
-                    if benefits and len(benefits) > 0:
-                        b = benefits[0].get("benefit")
-                        if b:
-                            item_name = b.get("name", item_name)
+                benefits = d.get("benefitEdges", [])
+                if benefits and len(benefits) > 0:
+                    b = benefits[0].get("benefit")
+                    if b:
+                        item_name = b.get("name", item_name)
 
-                    yield Drop(id=drop_id, game=game_name, item=item_name, expires_at=expires_at)
-            return
-        except Exception as e:
-            errors.append(str(e))
-    
-    raise RuntimeError(f"Scraping falhou: {errors}")
+                yield Drop(id=drop_id, game=game_name, item=item_name, expires_at=expires_at)
+    except Exception as e:
+        raise RuntimeError(f"Scraping falhou: {e}")
 
 def discord_api_delete_message(token: str, channel_id: str, message_id: str):
     req = urllib.request.Request(
@@ -127,9 +108,8 @@ def discord_api_delete_message(token: str, channel_id: str, message_id: str):
     )
     try:
         urllib.request.urlopen(req)
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            print(f"Erro ao deletar mensagem {message_id}: {e}")
+    except Exception as e:
+        print(f"Erro ao deletar: {e}")
 
 def discord_webhook_post_message(webhook_url: str, embed: dict) -> dict:
     req = urllib.request.Request(
@@ -140,14 +120,6 @@ def discord_webhook_post_message(webhook_url: str, embed: dict) -> dict:
     with urllib.request.urlopen(req) as response:
         return json.loads(response.read().decode("utf-8"))
 
-def build_embed(drop: Drop) -> dict:
-    return {
-        "title": f"🎮 Novo Drop: {drop.game}",
-        "description": f"**Item:** {drop.item}\n**Expira em:** {drop.expires_at}",
-        "color": 0x9146FF,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
@@ -157,46 +129,47 @@ def main():
     bot_token = os.getenv("DISCORD_BOT_TOKEN")
     oauth_token = os.getenv("TWITCH_OAUTH_TOKEN")
 
-    if not all([webhook_url, bot_token, oauth_token]):
-        sys.exit(1)
-
     if os.path.exists(args.state_file):
         with open(args.state_file, "r", encoding="utf-8") as f:
             try: active = json.load(f)
             except: active = {}
-    else:
-        active = {}
+    else: active = {}
 
     scraped = []
     scrape_ok = True
     try:
         scraped = list(scrape_twitch_drops(oauth_token))
     except Exception as e:
-        print(f"Falha no Scraping: {e}", file=sys.stderr)
+        print(f"{e}", file=sys.stderr)
         scrape_ok = False
 
     now = datetime.now(timezone.utc)
     scraped_ids = {d.id for d in scraped}
     to_remove = []
 
-    # 1. Deletar expirados
+    # Deletar expirados
     for drop_id, info in active.items():
         try:
             expiry = datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00"))
-            if expiry < now or (scrape_ok and drop_id not in scraped_ids):
+            if expiry < now:
                 discord_api_delete_message(bot_token, info["channel_id"], info["message_id"])
                 to_remove.append(drop_id)
         except: to_remove.append(drop_id)
 
-    for r in to_remove:
-        active.pop(r, None)
+    for r in to_remove: active.pop(r, None)
 
-    # 2. Postar novos
+    # Postar novos
     posted = 0
     for drop in scraped:
         if drop.id in active: continue
         try:
-            msg = discord_webhook_post_message(webhook_url, build_embed(drop))
+            embed = {
+                "title": f"🌍 Drop Global: {drop.game}",
+                "description": f"**Item:** {drop.item}\n**Expira em:** {drop.expires_at}",
+                "color": 0x00ff00,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            msg = discord_webhook_post_message(webhook_url, embed)
             if msg and "id" in msg:
                 active[drop.id] = {
                     "message_id": msg["id"],
@@ -204,13 +177,12 @@ def main():
                     "expires_at": drop.expires_at
                 }
                 posted += 1
-        except Exception as e:
-            print(f"Erro ao postar drop {drop.id}: {e}")
+        except: pass
 
     with open(args.state_file, "w", encoding="utf-8") as f:
         json.dump(active, f, indent=2, ensure_ascii=False)
 
-    print(json.dumps({"scrape_ok": scrape_ok, "scraped": len(scraped), "posted": posted, "active_total": len(active)}))
+    print(json.dumps({"status": "ok" if scrape_ok else "failed", "found": len(scraped), "new": posted}))
 
 if __name__ == "__main__":
     main()
